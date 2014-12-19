@@ -1,0 +1,117 @@
+#!/usr/bin/env perl
+#
+# Check the TLS ciphers offered by an XMPP server when other servers connect.
+#
+# Copyright (c) 2014 Holger Weiss <holger@zedat.fu-berlin.de>
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+# REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+# AND FITNESS.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+# INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+# LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+# OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+# PERFORMANCE OF THIS SOFTWARE.
+#
+use strict;
+use warnings;
+use Net::SSLeay qw(die_now die_if_ssl_error);
+use Socket;
+
+die "Usage: $0 <server>\n" if $#ARGV != 0;
+
+$| = 1;
+
+my $server = $ARGV[0];
+my $address = gethostbyname($server);
+my $server_addr = sockaddr_in(5269, $address);
+
+Net::SSLeay::initialize();
+
+sub receive_tag {
+	my $socket = shift;
+	my $data;
+	my $size = 0;
+	my $n = 0;
+
+	do {
+		$n = read($socket, $data, 1, $size);
+		die "Cannot receive data: $!\n" if not defined $n;
+		$size += $n;
+	} while ($n > 0 and $data !~ />/);
+
+	return $data;
+}
+
+sub get_ciphers {
+	my $ctx = Net::SSLeay::CTX_new()
+	    or die_now("Cannot create TLS context: $!");
+	my $ssl = Net::SSLeay::new($ctx)
+	    or die_now("Cannot create TLS object: $!");
+
+	my $priority = 0;
+	my @ciphers;
+
+	while (my $cipher = Net::SSLeay::get_cipher_list($ssl, $priority)) {
+		push(@ciphers, $cipher);
+		$priority++;
+	}
+
+	Net::SSLeay::free($ssl);
+	Net::SSLeay::CTX_free($ctx);
+
+	return @ciphers;
+}
+
+sub try_cipher {
+	my $cipher = shift;
+	my $socket;
+	my $data;
+
+	socket($socket, &AF_INET, &SOCK_STREAM, 0)
+	    or die "Cannot create socket: $!\n";
+	connect($socket, $server_addr)
+	    or die "Cannot connect to $server: $!\n";
+	select($socket); $| = 1; select(STDOUT);
+
+	print $socket
+	    "<stream:stream ",
+	    " xmlns:stream='http://etherx.jabber.org/streams' ",
+	    " xmlns='jabber:server' ",
+	    " from='example.com' ",
+	    " to='$server' ",
+	    " version='1.0'>\n",
+	    "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>\n"
+	    or die "Cannot talk to server: $!\n";
+
+	do {
+		$data = receive_tag($socket)
+	} while ($data !~ /<proceed.*\/>/);
+
+	my $ctx = Net::SSLeay::CTX_new()
+	    or die_now("Cannot create TLS context: $!");
+	Net::SSLeay::CTX_set_options($ctx, &Net::SSLeay::OP_ALL)
+	    or die_if_ssl_error("Cannot set TLS context options");
+	Net::SSLeay::CTX_set_cipher_list($ctx, $cipher)
+	    or die "Cannot use cipher $cipher.\n";
+
+	my $ssl = Net::SSLeay::new($ctx)
+	    or die_now("Cannot create TLS object: $!");
+	Net::SSLeay::set_fd($ssl, fileno($socket));
+
+	my $ret = Net::SSLeay::connect($ssl);
+	my $res = Net::SSLeay::get_error($ssl, $ret);
+
+	Net::SSLeay::free($ssl);
+	Net::SSLeay::CTX_free($ctx);
+	close($socket);
+
+	return $res == 0;
+}
+
+foreach my $cipher (get_ciphers) {
+	print "$cipher\n" if try_cipher($cipher);
+}
